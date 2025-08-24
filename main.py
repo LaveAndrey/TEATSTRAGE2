@@ -482,7 +482,7 @@ class DatabaseManager:
             FROM fiveminute_data 
             WHERE symbol = ? 
             ORDER BY timestamp DESC 
-            LIMit ?
+            LIMIT ?
         '''
         cursor = self.execute_query(query, (symbol, limit))
         return cursor.fetchall()
@@ -654,7 +654,7 @@ class TradingBot:
 
             timestamp = int(tick['ts']) // 1000
             price = float(tick['last'])
-            volume = float(tick['lastSz'])
+            volume = float(tick['lastSz']) * price
 
             self.tick_buffer[symbol].append({'timestamp': timestamp, 'price': price, 'volume': volume})
             if len(self.tick_buffer[symbol]) > 200:
@@ -801,12 +801,13 @@ class TradingBot:
                 return
 
             # 2. ФИЛЬТР ОБЪЕМА
+            """
             avg_volume = self.data[symbol]['volume'].tail(20).mean()
             current_volume = self.current_candle[symbol]['volume']
             if current_volume < avg_volume * MIN_VOLUME_RATIO:
-                logger.debug(
-                    f"📉 СЛАБЫЙ ОБЪЕМ {symbol}: need {avg_volume * MIN_VOLUME_RATIO:.2f}, have {current_volume:.2f}")
+                logger.debug(f"📉 СЛАБЫЙ ОБЪЕМ {symbol}: need {avg_volume * MIN_VOLUME_RATIO:.2f}, have {current_volume:.2f}")
                 return
+            """
 
             # 3. ФИЛЬТР ПОДТВЕРЖДЕНИЯ СВЕЧАМИ
             if len(self.data[symbol]) >= CONSECUTIVE_BARS_CONFIRMATION:
@@ -861,7 +862,7 @@ class TradingBot:
             # Логирование деталей
             logger.info(f"🎯 {symbol} | Цена: {current_close:.2f}")
             logger.info(f"📊 RSI: {rsi:.2f} | MACD: {macd:.4f} | Signal: {signal_line:.4f}")
-            logger.info(f"📈 Hist: {hist:.4f} | Vol: {current_volume:.2f}/{avg_volume * MIN_VOLUME_RATIO:.2f}")
+            logger.info(f"📈 Hist: {hist:.4f}")
             logger.info(f"🚀 BUY: {buy_condition} | SELL: {sell_condition}")
 
             # Сохранение текущих индикаторов
@@ -1204,7 +1205,7 @@ class TradingBot:
 if __name__ == "__main__":
     logger.info("🛠️ Инициализация парсера аргументов...")
     parser = argparse.ArgumentParser(description="Торговый бот")
-    parser.add_argument('--duration', type=int, default=86400, help='Длительность теста в секундах')
+    parser.add_argument('--duration', type=int, default=None, help='Длительность теста в секундах')
     parser.add_argument('--balance', type=float, default=INITIAL_BALANCE, help='Начальный баланс в USDT')
     args = parser.parse_args()
     logger.info(f"⚙️ Параметры запуска: duration={args.duration}, balance={args.balance}")
