@@ -641,31 +641,43 @@ class TradingBot:
             return None, None, None
 
     def get_1h_trend(self, symbol):
-        """Определяет тренд на 1h по EMA(20)"""
+        """Определяет тренд на 1h по EMA(20) с защитой от ошибок"""
         try:
             # Получаем данные с биржи для 1h
-            url = "https://www.okx.com/api/v5/market/candles"
+            url = "https://www.okx.com/api/v5/market/history-candles"  # ← ИСПРАВЛЕННЫЙ ЭНДПОИНТ!
             params = {
                 'instId': symbol,
-                'bar': TREND_TF,
-                'limit': str(TREND_EMA_PERIOD + 10)
+                'bar': '1H',  # ← ЧАСЫ ПИШЕМ БОЛЬШИМИ БУКВАМИ!
+                'limit': '30'  # ← 30 свечей хватит
             }
 
-            response = requests.get(url, params=params, timeout=5)
+            # Добавляем заголовки чтобы не блокировали
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            response = requests.get(url, params=params, headers=headers, timeout=10)  # ← timeout 10 сек
+            response.raise_for_status()  # ← Проверяем HTTP ошибки
+
             data = response.json()
 
-            if data.get('code') != '0' or not data.get('data'):
-                logger.warning(f"⚠️ Нет данных для определения тренда {symbol}")
+            # Проверяем ответ API OKX
+            if data.get('code') != '0':
+                logger.warning(f"⚠️ API OKX error: {data.get('msg')}")
                 return 'neutral'
 
-            # Парсим свечи
+            if not data.get('data') or len(data['data']) < 20:
+                logger.warning(f"⚠️ Мало данных для {symbol}: {len(data['data']) if data.get('data') else 0} свечей")
+                return 'neutral'
+
+            # Парсим свечи (обратный порядок - последняя свеча первая)
             candles = data['data']
-            closes = [float(c[4]) for c in candles]  # close prices
+            closes = [float(c[4]) for c in candles]  # close price на 4 позиции
             closes_series = pd.Series(closes)
 
             # Считаем EMA
             ema = closes_series.ewm(span=TREND_EMA_PERIOD).mean().iloc[-1]
-            current_price = closes[-1]
+            current_price = closes[0]  # ← Первая свеча в массиве - последняя по времени!
 
             # Определяем силу и направление тренда
             trend_strength = abs((current_price - ema) / ema) * 100
@@ -681,8 +693,16 @@ class TradingBot:
                 logger.info(f"📉 {symbol}: МЕДВЕЖИЙ тренд на 1h (сила: {trend_strength:.2f}%)")
                 return 'bearish'
 
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏰ Таймаут запроса тренда для {symbol}")
+            return 'neutral'
+
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"📡 Ошибка соединения для {symbol}")
+            return 'neutral'
+
         except Exception as e:
-            logger.error(f"❌ Ошибка определения тренда для {symbol}: {e}")
+            logger.error(f"❌ Критическая ошибка тренда для {symbol}: {str(e)}")
             return 'neutral'
 
     async def handle_tick(self, message):
