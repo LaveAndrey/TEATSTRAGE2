@@ -482,7 +482,7 @@ class DatabaseManager:
             FROM fiveminute_data 
             WHERE symbol = ? 
             ORDER BY timestamp DESC 
-            LIMIT ?
+            LIMit ?
         '''
         cursor = self.execute_query(query, (symbol, limit))
         return cursor.fetchall()
@@ -640,6 +640,51 @@ class TradingBot:
             logger.error(f"Ошибка расчета MACD: {str(e)}")
             return None, None, None
 
+    def get_1h_trend(self, symbol):
+        """Определяет тренд на 1h по EMA(20)"""
+        try:
+            # Получаем данные с биржи для 1h
+            url = "https://www.okx.com/api/v5/market/candles"
+            params = {
+                'instId': symbol,
+                'bar': TREND_TF,
+                'limit': str(TREND_EMA_PERIOD + 10)
+            }
+
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json()
+
+            if data.get('code') != '0' or not data.get('data'):
+                logger.warning(f"⚠️ Нет данных для определения тренда {symbol}")
+                return 'neutral'
+
+            # Парсим свечи
+            candles = data['data']
+            closes = [float(c[4]) for c in candles]  # close prices
+            closes_series = pd.Series(closes)
+
+            # Считаем EMA
+            ema = closes_series.ewm(span=TREND_EMA_PERIOD).mean().iloc[-1]
+            current_price = closes[-1]
+
+            # Определяем силу и направление тренда
+            trend_strength = abs((current_price - ema) / ema) * 100
+
+            if trend_strength < MIN_TREND_STRENGTH:
+                logger.debug(f"📊 {symbol}: Тренд слишком слабый ({trend_strength:.2f}%)")
+                return 'neutral'
+
+            if current_price > ema:
+                logger.info(f"📈 {symbol}: БЫЧИЙ тренд на 1h (сила: {trend_strength:.2f}%)")
+                return 'bullish'
+            else:
+                logger.info(f"📉 {symbol}: МЕДВЕЖИЙ тренд на 1h (сила: {trend_strength:.2f}%)")
+                return 'bearish'
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка определения тренда для {symbol}: {e}")
+            return 'neutral'
+
     async def handle_tick(self, message):
         try:
             inst_id = message['arg']['instId']
@@ -654,7 +699,7 @@ class TradingBot:
 
             timestamp = int(tick['ts']) // 1000
             price = float(tick['last'])
-            volume = float(tick['lastSz']) * price
+            volume = float(tick['lastSz'])
 
             self.tick_buffer[symbol].append({'timestamp': timestamp, 'price': price, 'volume': volume})
             if len(self.tick_buffer[symbol]) > 200:
@@ -758,12 +803,9 @@ class TradingBot:
 
     async def process_indicators(self, symbol):
         logger.debug(f"🔍 Начало расчёта индикаторов для {symbol}")
-
-        # Проверка наличия данных
-        if self.data[symbol].empty or len(self.data[symbol]) < MIN_CANDLES_FOR_ANALYSIS:
-            logger.debug(f"⚠️ Недостаточно данных для {symbol}")
+        if self.data[symbol].empty:
+            logger.debug(f"⚠️ Нет исторических данных для {symbol}")
             return
-
         if self.current_candle[symbol] is None:
             logger.debug(f"⚠️ Текущая свеча для {symbol} отсутствует")
             return
@@ -772,100 +814,40 @@ class TradingBot:
         with self._tick_lock:
             current_tick_count = self.tick_count[symbol]
 
-        # Подготовка данных для расчета
-        min_data_required = MACD_SLOW + MACD_SIGNAL + 30
+        min_data_required = MACD_SLOW + MACD_SIGNAL + 20
         historical_closes = self.data[symbol]['close'].tail(min_data_required)
+        logger.debug(f"🔎 Исторических свечей: {len(historical_closes)}")
+        current_close = self.current_candle[symbol]['close']
+        logger.debug(f"💸 Текущая цена: {current_close:.2f}")
+        all_closes = pd.Series(list(historical_closes) + [current_close])
+        logger.debug(f"📊 Всего точек для расчета: {len(all_closes)}")
 
         if len(historical_closes) < min_data_required:
             logger.debug(f"⚠️ Недостаточно исторических данных: {len(historical_closes)} < {min_data_required}")
             return
 
-        current_close = self.current_candle[symbol]['close']
-        all_closes = pd.Series(list(historical_closes) + [current_close])
-
         try:
-            # Расчет индикаторов
             rsi = self.calculate_rsi(all_closes)
+            if rsi is None:
+                logger.debug(f"⚠️ RSI не рассчитан")
+                return
+
             macd, signal_line, hist = self.calculate_macd(all_closes)
-
-            if rsi is None or macd is None:
-                logger.debug(f"⚠️ Индикаторы не рассчитаны для {symbol}")
+            if macd is None:
+                logger.debug(f"⚠️ MACD не рассчитан")
                 return
 
-            # 🔥🔥🔥 ЖЕСТКИЕ ФИЛЬТРЫ - НАЧАЛО 🔥🔥🔥
+            #logger.info(
+            #    f"📈 Индикаторы для {symbol}: RSI={rsi:.2f}, MACD={macd:.4f}, Signal={signal_line:.4f}, Hist={hist:.4f}, Price={current_close:.2f}"
+            #)
+            logger.debug(f"📊 Условия: RSI < {RSI_BUY_THRESHOLD} = {rsi < RSI_BUY_THRESHOLD}, "
+                         f"RSI > {RSI_SELL_THRESHOLD} = {rsi > RSI_SELL_THRESHOLD}, "
+                         f"MACD > Signal = {macd > signal_line}, "
+                         f"MACD < Signal = {macd < signal_line}")
 
-            # 1. ФИЛЬТР СИЛЫ MACD (САМЫЙ ВАЖНЫЙ)
-            min_required_power = current_close * MIN_MACD_HIST_POWER
-            if abs(hist) < min_required_power:
-                logger.debug(f"💩 СЛАБЫЙ MACD {symbol}: need {min_required_power:.4f}, have {hist:.4f}")
-                return
-
-            # 2. ФИЛЬТР ОБЪЕМА
-            """
-            avg_volume = self.data[symbol]['volume'].tail(20).mean()
-            current_volume = self.current_candle[symbol]['volume']
-            if current_volume < avg_volume * MIN_VOLUME_RATIO:
-                logger.debug(f"📉 СЛАБЫЙ ОБЪЕМ {symbol}: need {avg_volume * MIN_VOLUME_RATIO:.2f}, have {current_volume:.2f}")
-                return
-            """
-
-            # 3. ФИЛЬТР ПОДТВЕРЖДЕНИЯ СВЕЧАМИ
-            if len(self.data[symbol]) >= CONSECUTIVE_BARS_CONFIRMATION:
-                last_candle = self.data[symbol].iloc[-1]
-                prev_candle = self.data[symbol].iloc[-2]
-
-                # Определяем сторону для проверки
-                if macd > signal_line:  # потенциальная покупка
-                    if last_candle['close'] < last_candle['open'] or prev_candle['close'] < prev_candle['open']:
-                        logger.debug(f"🔻 НЕТ БЫЧЬЕГО ПОДТВЕРЖДЕНИЯ {symbol}")
-                        return
-                else:  # потенциальная продажа
-                    if last_candle['close'] > last_candle['open'] or prev_candle['close'] > prev_candle['open']:
-                        logger.debug(f"🔺 НЕТ МЕДВЕЖЬЕГО ПОДТВЕРЖДЕНИЯ {symbol}")
-                        return
-
-            # 4. ФИЛЬТР RSI (УЖЕСТОЧЕННЫЙ)
-            if rsi > RSI_BUY_THRESHOLD and rsi < RSI_SELL_THRESHOLD:
-                logger.debug(f"🎯 RSI В НЕОПРЕДЕЛЕННОСТИ {symbol}: {rsi:.2f}")
-                return
-
-            # 5. ФИЛЬТР ТРЕНДА (ЕСЛИ ВКЛЮЧЕН)
-            if TREND_FILTER:
-                ema = self.data[symbol]['close'].tail(TREND_EMA_PERIOD).mean()
-                # Для покупки: цена выше EMA
-                if macd > signal_line and current_close < ema:
-                    logger.debug(f"📉 НЕТ БЫЧЬЕГО ТРЕНДА {symbol}: цена {current_close:.2f} < EMA {ema:.2f}")
-                    return
-                # Для продажи: цена ниже EMA
-                if macd < signal_line and current_close > ema:
-                    logger.debug(f"📈 НЕТ МЕДВЕЖЬЕГО ТРЕНДА {symbol}: цена {current_close:.2f} > EMA {ema:.2f}")
-                    return
-
-            # 🔥🔥🔥 ФИЛЬТРЫ ПРОЙДЕНЫ - ПРОВЕРЯЕМ СИГНАЛЫ 🔥🔥🔥
-
-            prev_macd = self.last_macd[symbol]
-
-            # УСЛОВИЯ ПОКУПКИ (ЖЕСТКИЕ)
-            buy_condition = (rsi < RSI_BUY_THRESHOLD and  # RSI глубоко в перепроданности
-                             macd > signal_line and  # MACD выше сигнала
-                             abs(hist) > min_required_power and  # Сильная гистограмма
-                             prev_macd is not None and  # Есть предыдущее значение
-                             prev_macd <= signal_line)  # Было пересечение снизу
-
-            # УСЛОВИЯ ПРОДАЖИ (ЖЕСТКИЕ)
-            sell_condition = (rsi > RSI_SELL_THRESHOLD and  # RSI глубоко в перекупленности
-                              macd < signal_line and  # MACD ниже сигнала
-                              abs(hist) > min_required_power and  # Сильная гистограмма
-                              prev_macd is not None and  # Есть предыдущее значение
-                              prev_macd >= signal_line)  # Было пересечение сверху
-
-            # Логирование деталей
-            logger.info(f"🎯 {symbol} | Цена: {current_close:.2f}")
-            logger.info(f"📊 RSI: {rsi:.2f} | MACD: {macd:.4f} | Signal: {signal_line:.4f}")
-            logger.info(f"📈 Hist: {hist:.4f}")
-            logger.info(f"🚀 BUY: {buy_condition} | SELL: {sell_condition}")
-
-            # Сохранение текущих индикаторов
+            # Сохранение текущих индикаторов в БД
+            current_timestamp = int(time.time())
+            current_minute = (current_timestamp // 60) * 60
             indicators = {
                 'rsi': rsi,
                 'macd': macd,
@@ -873,24 +855,71 @@ class TradingBot:
                 'macd_hist': hist
             }
             self.save_current_indicators(symbol, current_tick_count, indicators, current_close)
+            logger.debug(f"💾 Текущие индикаторы сохранены в БД (тик #{current_tick_count})")
+
+            prev_macd = self.last_macd[symbol]
+
+            buy_condition = (rsi < RSI_BUY_THRESHOLD and
+                             macd > signal_line and
+                             prev_macd is not None and
+                             prev_macd <= signal_line)  # ← Сравнивать с ТЕКУЩЕЙ сигнальной линией
+
+            sell_condition = (rsi > RSI_SELL_THRESHOLD and
+                              macd < signal_line and
+                              prev_macd is not None and
+                              prev_macd >= signal_line)
+
+            logger.debug(f"🎯 ДЕТАЛЬНЫЙ АНАЛИЗ УСЛОВИЙ ДЛЯ {symbol}:")
+            logger.debug(f"   Цена: {current_close:.2f}")
+            logger.debug(f"   RSI: {rsi:.2f}")
+            logger.debug(f"   📈 BUY УСЛОВИЯ:")
+            logger.debug(f"     RSI {rsi:.2f} < {RSI_BUY_THRESHOLD} = {rsi < RSI_BUY_THRESHOLD}")
+            logger.debug(f"     MACD {macd:.4f} > Signal {signal_line:.4f} = {macd > signal_line}")
+            #logger.debug(f"     Prev MACD {prev_macd if prev_macd is not None else 'None'} <= Prev Signal {prev_signal if prev_signal is not None else 'None'} = {prev_macd is not None and prev_signal is not None and prev_macd <= prev_signal}")
+            logger.debug(f"     📊 BUY сигнал = {buy_condition}")
+            logger.debug(f"   📉 SELL УСЛОВИЯ:")
+            logger.debug(f"     RSI {rsi:.2f} > {RSI_SELL_THRESHOLD} = {rsi > RSI_SELL_THRESHOLD}")
+            logger.debug(f"     MACD {macd:.4f} < Signal {signal_line:.4f} = {macd < signal_line}")
+            #logger.debug(f"     Prev MACD {prev_macd if prev_macd is not None else 'None'} >= Prev Signal {prev_signal if prev_signal is not None else 'None'} = {prev_macd is not None and prev_signal is not None and prev_macd >= prev_signal}")
+            logger.debug(f"     📊 SELL сигнал = {sell_condition}")
+
+            if prev_macd is not None:
+                logger.debug(f"   🔄 ИСТОРИЯ ПЕРЕСЕЧЕНИЙ:")
+                logger.debug(f"     Предыдущий MACD: {prev_macd:.4f}")
+                logger.debug(f"     Текущий MACD: {macd:.4f}")
+                logger.debug(f"     Сигнальная линия: {signal_line:.4f}")
+                if prev_macd <= signal_line and macd > signal_line:
+                    logger.info(f"     ✅ MACD ПЕРЕСЕК СИГНАЛ СНИЗУ ВВЕРХ!")
+                elif prev_macd >= signal_line and macd < signal_line:
+                    logger.info(f"     ✅ MACD ПЕРЕСЕК СИГНАЛ СВЕРХУ ВНИЗ!")
+                else:
+                    logger.debug(f"     ❌ Пересечения нет")
+            else:
+                logger.info(f"   ⏭️ Нет данных о предыдущем MACD")
 
             # Обновляем значения ПОСЛЕ проверки условий
             self.last_macd[symbol] = macd
             self.last_signal[symbol] = signal_line
 
-            # ВХОД В СДЕЛКУ
             if buy_condition:
-                logger.info(f"🚀🚀🚀 BUY СИГНАЛ ДЛЯ {symbol}! 🚀🚀🚀")
+                logger.info(f"🚀 ОБНАРУЖЕН BUY СИГНАЛ ДЛЯ {symbol}!")
+                logger.info(f"   RSI: {rsi:.2f} < {RSI_BUY_THRESHOLD}")
+                logger.info(f"   MACD: {macd:.4f} > Signal: {signal_line:.4f}")
+                logger.info(f"   Пересечение: {prev_macd if prev_macd is not None else 'None'} → {macd:.4f}")
                 await self.open_position(symbol, 'buy')
             elif sell_condition:
-                logger.info(f"🚀🚀🚀 SELL СИГНАЛ ДЛЯ {symbol}! 🚀🚀🚀")
+                logger.info(f"🚀 ОБНАРУЖЕН SELL СИГНАЛ ДЛЯ {symbol}!")
+                logger.info(f"   RSI: {rsi:.2f} > {RSI_SELL_THRESHOLD}")
+                logger.info(f"   MACD: {macd:.4f} < Signal: {signal_line:.4f}")
+                logger.info(f"   Пересечение: {prev_macd if prev_macd is not None else 'None'} → {macd:.4f}")
                 await self.open_position(symbol, 'sell')
             else:
                 logger.debug(f"📊 Сигналов для {symbol} нет")
 
+        except TypeError as e:
+            logger.error(f"❌ Ошибка типа при расчете индикаторов: {str(e)}")
         except Exception as e:
-            logger.error(f"❌ Ошибка в process_indicators: {str(e)}")
-            logger.debug("Стек вызовов:", exc_info=True)
+            logger.error(f"❌ Неизвестная ошибка при расчете индикаторов: {str(e)}")
 
     def save_current_indicators(self, symbol, tick_count, indicators, current_price):
         try:
@@ -916,6 +945,19 @@ class TradingBot:
 
     async def open_position(self, symbol, side):
         logger.info(f"🚀 Попытка открыть позицию {side} по {symbol}...")
+
+        trend = self.get_1h_trend(symbol)
+
+        # Для лонга: тренд должен быть бычьим
+        if side == 'buy' and trend != 'bullish':
+            logger.info(f"🚫 ФИЛЬТР: Нет бычьего тренда на 1h - пропускаем лонг по {symbol}")
+            return
+
+        # Для шорта: тренд должен быть медвежьим
+        if side == 'sell' and trend != 'bearish':
+            logger.info(f"🚫 ФИЛЬТР: Нет медвежьего тренда на 1h - пропускаем шорт по {symbol}")
+            return
+
         open_positions = self.db.get_open_positions(symbol)
         if open_positions:
             logger.warning(f"⏸ Уже есть открытая позиция по {symbol}")
